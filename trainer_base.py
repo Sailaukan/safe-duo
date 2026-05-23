@@ -79,7 +79,7 @@ class TrainerBase(L.LightningModule):
     tokenizer: transformers.PreTrainedTokenizer,
     vocab_size=None):
     super().__init__()
-    self.save_hyperparameters()
+    self.save_hyperparameters(ignore=['tokenizer'])
     self.config = config
     if hasattr(self.config.algo, 'ignore_bos'):
       self.ignore_bos = config.algo.ignore_bos
@@ -562,7 +562,7 @@ class Diffusion(TrainerBase):
     """Top-level call from generate_samples. Compute the 
        standard posterior sampling distribution from the 
        noisy sequence xt"""
-    gamma = self.config.sampling.guid_weight
+    gamma = self.config.sampling.get('guid_weight', None)
     # If class cond but gamma is None or 0, same as sampling 
     #  from the class unconditional case.
     if not self.class_conditional or gamma in (None, 0.0):
@@ -672,11 +672,12 @@ class Diffusion(TrainerBase):
     return p_x0, sample_categorical(q_sample)
 
   def _get_sampling_time_profile(self, eps, num_steps):
-    profile = self.config.sampling.psi.time_profile
     num_steps += 1
-    if profile == 'linear' \
-      or self.config.sampling.predictor != 'psi':
+    if self.config.sampling.predictor != 'psi':
       # Default: linearly decrease
+      return torch.linspace(1, eps, num_steps)
+    profile = self.config.sampling.psi.time_profile
+    if profile == 'linear':
       return torch.linspace(1, eps, num_steps)
     if not profile.startswith('linear-constant-linear'):
       raise ValueError(profile)
@@ -741,12 +742,17 @@ class Diffusion(TrainerBase):
 
   @torch.no_grad()
   def generate_samples(self, num_samples, labels=None,
-                       num_steps=None, eps=1e-5):
+                       num_steps=None, eps=1e-5,
+                       token_template=None,
+                       known_token_mask=None):
     """Generate samples from the model."""
     # Lightning auto-casting is not working in this method for some reason
     if num_steps is None:
       num_steps = self.config.sampling.steps
     x = self.prior_sample(num_samples, self.num_tokens)
+    if token_template is not None or known_token_mask is not None:
+      x = self._apply_known_token_template(
+        x, token_template, known_token_mask)
     use_psi_sampler = self.config.sampling.predictor == 'psi'
     timesteps = self._get_sampling_time_profile(eps, 
                                                 num_steps)
@@ -782,6 +788,9 @@ class Diffusion(TrainerBase):
         x = self._analytic_update(x=x,t=t, dt=dt)
       else:
         raise ValueError(self.sampler)
+      if token_template is not None or known_token_mask is not None:
+        x = self._apply_known_token_template(
+          x, token_template, known_token_mask)
 
     t0 = timesteps[-1] * torch.ones(x.shape[0], 1,
                                     device=self.device)
@@ -794,7 +803,34 @@ class Diffusion(TrainerBase):
     elif self.config.sampling.noise_removal == 'greedy':
       sigma = self._sigma_from_alphat(self.noise(t0)[1])
       x = self.forward(xt=x, sigma=sigma).argmax(dim=-1)
+    if token_template is not None or known_token_mask is not None:
+      x = self._apply_known_token_template(
+        x, token_template, known_token_mask)
     return x
+
+  def _apply_known_token_template(self, x, token_template,
+                                  known_token_mask):
+    if token_template is None or known_token_mask is None:
+      raise ValueError(
+        'token_template and known_token_mask must be provided together.')
+    token_template = torch.as_tensor(
+      token_template, dtype=x.dtype, device=x.device)
+    known_token_mask = torch.as_tensor(
+      known_token_mask, dtype=torch.bool, device=x.device)
+    if token_template.ndim == 1:
+      token_template = token_template.unsqueeze(0)
+    if known_token_mask.ndim == 1:
+      known_token_mask = known_token_mask.unsqueeze(0)
+    if token_template.shape != known_token_mask.shape:
+      raise ValueError(
+        'token_template and known_token_mask must have the same shape.')
+    if token_template.shape[-1] != x.shape[-1]:
+      raise ValueError(
+        f'template length {token_template.shape[-1]} does not match '
+        f'sample length {x.shape[-1]}.')
+    token_template = token_template.expand(x.shape[0], -1)
+    known_token_mask = known_token_mask.expand(x.shape[0], -1)
+    return torch.where(known_token_mask, token_template, x)
 
   @torch.no_grad
   def _semi_ar_sampler(
@@ -870,7 +906,7 @@ class AbsorbingState(Diffusion):
     self.subs_masking = config.algo.subs_masking
     super().__init__(config, tokenizer,
                      vocab_size=vocab_size)
-    self.save_hyperparameters()
+    self.save_hyperparameters(ignore=['tokenizer'])
 
   def _validate_configuration(self):
     super()._validate_configuration()

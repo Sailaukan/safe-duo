@@ -12,7 +12,10 @@ nvitop==1.3.2
 omegaconf==2.3.0
 packaging==23.2
 pandas==2.2.1
+pytdc==1.1.15
 rich==13.7.1
+rdkit==2024.9.6
+safe-mol==0.1.14
 seaborn==0.13.2
 scikit-learn==1.4.0
 transformers==4.38.2

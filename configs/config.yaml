@@ -19,7 +19,7 @@ loader:
   # Note: batch_size and eval_batch_size are **per machine**
   batch_size: ${div_up:${.global_batch_size}, ${eval:${trainer.devices} * ${trainer.num_nodes}}}
   eval_batch_size: ${div_up:${.eval_global_batch_size}, ${eval:${trainer.devices} * ${trainer.num_nodes}}}
-  num_workers: ${eval:"len(__import__('os').sched_getaffinity(0))"}
+  num_workers: ${eval:"len(__import__('os').sched_getaffinity(0)) if hasattr(__import__('os'), 'sched_getaffinity') else (__import__('os').cpu_count() or 1)"}
   pin_memory: True
 
 sampling:

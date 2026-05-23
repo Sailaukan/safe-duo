@@ -2,13 +2,19 @@ import math
 import typing
 
 import einops
-import flash_attn
-import flash_attn.layers.rotary
 import huggingface_hub
 import omegaconf
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+try:
+  import flash_attn
+  import flash_attn.layers.rotary
+  HAS_FLASH_ATTN = True
+except ImportError:
+  flash_attn = None
+  HAS_FLASH_ATTN = False
 
 # Flags required to enable jit fusion kernels
 torch._C._jit_set_profiling_mode(False)
@@ -109,6 +115,12 @@ def rotate_half(x):
   return torch.cat((-x2, x1), dim=-1)
 
 
+def _apply_rotary_emb_torch(x, cos, sin):
+  cos = torch.cat([cos, cos], dim=-1)[None, :, None, :]
+  sin = torch.cat([sin, sin], dim=-1)[None, :, None, :]
+  return (x * cos) + (rotate_half(x) * sin)
+
+
 def split_and_apply_rotary_pos_emb(qkv, rotary_cos_sin):
   with torch.amp.autocast('cuda', enabled=False):
     cos, sin = rotary_cos_sin
@@ -117,10 +129,16 @@ def split_and_apply_rotary_pos_emb(qkv, rotary_cos_sin):
     cos = cos[0,:,0,0,:cos.shape[-1]//2]
     sin = sin[0,:,0,0,:sin.shape[-1]//2]
     q, k, v = qkv.chunk(3, dim=2)
-    q = flash_attn.layers.rotary.apply_rotary_emb_torch(
-      q.squeeze(dim=2), cos, sin)
-    k = flash_attn.layers.rotary.apply_rotary_emb_torch(
-      k.squeeze(dim=2), cos, sin)
+    q = q.squeeze(dim=2)
+    k = k.squeeze(dim=2)
+    if HAS_FLASH_ATTN:
+      q = flash_attn.layers.rotary.apply_rotary_emb_torch(
+        q, cos, sin)
+      k = flash_attn.layers.rotary.apply_rotary_emb_torch(
+        k, cos, sin)
+    else:
+      q = _apply_rotary_emb_torch(q, cos, sin)
+      k = _apply_rotary_emb_torch(k, cos, sin)
     v = v.squeeze(dim=2)
   return q, k, v
 
@@ -128,10 +146,15 @@ def split_and_apply_rotary_pos_emb(qkv, rotary_cos_sin):
 def apply_rotary_pos_emb(qkv, cos, sin):
   cos = cos[0,:,0,0,:cos.shape[-1]//2]
   sin = sin[0,:,0,0,:sin.shape[-1]//2]
+  if not HAS_FLASH_ATTN:
+    q, k, v = qkv.chunk(3, dim=2)
+    q = _apply_rotary_emb_torch(q.squeeze(dim=2), cos, sin)
+    k = _apply_rotary_emb_torch(k.squeeze(dim=2), cos, sin)
+    return torch.stack([q, k, v.squeeze(dim=2)], dim=2)
   return flash_attn.layers.rotary.apply_rotary_emb_qkv_(qkv, cos, sin)
 
 
-def regular_attention_multi_headed(q, k, v):
+def regular_attention_multi_headed(q, k, v, is_causal=False):
   # Assuming qkv is a tensor with shape [batch, seq_len, 3, num_heads, head_dim]
   # where the 3 represents Q, K, V packed in that order
   attention_output = F.scaled_dot_product_attention(
@@ -140,7 +163,7 @@ def regular_attention_multi_headed(q, k, v):
     value=v.transpose(1, 2),
     attn_mask=None,
     dropout_p=0.0,
-    is_causal=False)
+    is_causal=is_causal)
   # [batch_size, seq_len, num_heads, head_dim]
   attention_output = attention_output.transpose(1, 2)
   return einops.rearrange(attention_output, 'b s h d -> b s (h d)')
@@ -281,15 +304,19 @@ class DDiTBlockCausal(nn.Module):
       qkv = apply_rotary_pos_emb(
         qkv, cos.to(qkv.dtype), sin.to(qkv.dtype)
       )
-    qkv = einops.rearrange(qkv, 'b s ... -> (b s) ...')
-    cu_seqlens = torch.arange(
-      0, (batch_size + 1) * seq_len,
-      step=seq_len, dtype=torch.int32, device=qkv.device)
-    x = flash_attn.flash_attn_interface.flash_attn_varlen_qkvpacked_func(
-      qkv, cu_seqlens, seq_len, 0.0, causal=True)
+    if HAS_FLASH_ATTN:
+      qkv = einops.rearrange(qkv, 'b s ... -> (b s) ...')
+      cu_seqlens = torch.arange(
+        0, (batch_size + 1) * seq_len,
+        step=seq_len, dtype=torch.int32, device=qkv.device)
+      x = flash_attn.flash_attn_interface.flash_attn_varlen_qkvpacked_func(
+        qkv, cu_seqlens, seq_len, 0.0, causal=True)
 
-    x = einops.rearrange(x, '(b s) h d -> b s (h d)',
-                         b=batch_size)
+      x = einops.rearrange(x, '(b s) h d -> b s (h d)',
+                           b=batch_size)
+    else:
+      q, k, v = qkv.unbind(dim=2)
+      x = regular_attention_multi_headed(q, k, v, is_causal=True)
 
     scale = torch.ones(1, device=x.device, dtype=x.dtype)
     x = bias_dropout_scale_fn(

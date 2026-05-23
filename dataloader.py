@@ -26,6 +26,14 @@ import utils
 
 LOGGER = utils.get_logger(__name__)
 
+SAFE_GPT_V1_REVISION = 'b83175cd7394'
+
+
+def _default_num_proc():
+  if hasattr(os, 'sched_getaffinity'):
+    return len(os.sched_getaffinity(0))
+  return os.cpu_count() or 1
+
 
 
 class RawPixelsVisionTokenizer:
@@ -492,13 +500,53 @@ def get_dataset(dataset_name,
                 cache_dir,
                 insert_eos=True,
                 block_size=1024,
-                num_proc=len(os.sched_getaffinity(0)),
+                num_proc=None,
                 streaming=False,
                 revision : Optional[str]=None):
+  if num_proc is None:
+    num_proc = _default_num_proc()
   if dataset_name == 'cifar10':
     assert mode in ('train', 'validation')
     return DiscreteCIFAR10(cache_dir=cache_dir, 
                            train=mode=='train')
+  if dataset_name == 'safe-gpt-v1':
+    if revision is None:
+      revision = SAFE_GPT_V1_REVISION
+    dataset = datasets.load_dataset(
+      'datamol-io/safe-gpt',
+      cache_dir=cache_dir,
+      streaming=streaming,
+      revision=revision)
+    data = dataset[mode]
+
+    def preprocess_safe(examples):
+      safe_column = 'safe' if 'safe' in examples else 'input'
+      if safe_column not in examples:
+        raise KeyError(
+          'SAFE-GPT V1 examples must contain a safe or input column.')
+      safe_strings = [
+        value for value in examples[safe_column]
+        if isinstance(value, str) and value
+      ]
+      if not safe_strings:
+        return {'input_ids': [], 'attention_mask': []}
+      tokenizer.padding_side = 'right'
+      tokenizer.truncation_side = 'right'
+      return tokenizer(
+        safe_strings,
+        max_length=block_size,
+        padding='max_length',
+        truncation=True,
+        add_special_tokens=True,
+        return_attention_mask=True,
+        return_token_type_ids=False)
+
+    tokenized_dataset = data.map(
+      preprocess_safe,
+      batched=True,
+      remove_columns=list(data.features))
+    return tokenized_dataset.with_format('torch')
+
   eos_tag = ''
   if not insert_eos:
     eos_tag = '_eosFalse'
@@ -626,8 +674,8 @@ def get_dataset(dataset_name,
       return text
     return detok
   
-  EOS = tokenizer.encode(tokenizer.eos_token)[0]
-  BOS = tokenizer.encode(tokenizer.bos_token)[0]
+  EOS = tokenizer.eos_token_id
+  BOS = tokenizer.bos_token_id
 
   def preprocess_and_tokenize(example):
     if dataset_name == 'ptb':
@@ -712,6 +760,18 @@ def get_dataset(dataset_name,
 def get_tokenizer(config):
   if config.data.tokenizer_name_or_path == 'text8':
     tokenizer = Text8Tokenizer()
+  elif config.data.tokenizer_name_or_path == 'safe-gpt':
+    try:
+      from safe.tokenizer import SAFETokenizer
+    except ImportError as exc:
+      raise ImportError(
+        'SAFE molecule tokenization requires safe-mol. '
+        'Install it with `pip install safe-mol`.') from exc
+    revision = getattr(
+      config.data, 'tokenizer_revision', SAFE_GPT_V1_REVISION)
+    tokenizer = SAFETokenizer.from_pretrained(
+      'datamol-io/safe-gpt',
+      revision=revision).get_pretrained()
   elif config.data.tokenizer_name_or_path == 'bert-base-uncased':
     tokenizer = transformers.BertTokenizer.\
       from_pretrained('bert-base-uncased')

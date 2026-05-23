@@ -78,11 +78,13 @@ class Metrics:
     self.sample_entropy = torchmetrics.aggregation.MeanMetric()
     self.eval_ppl_batch_size = eval_ppl_batch_size
     self.gen_ppl_eval_model_name_or_path = gen_ppl_eval_model_name_or_path
-    self.tokenizer = transformers.AutoTokenizer.\
-      from_pretrained(gen_ppl_eval_model_name_or_path)
-    if self.tokenizer.pad_token is None:
-      self.tokenizer.pad_token = self.tokenizer.eos_token
-      self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+    self.tokenizer = None
+    if gen_ppl_eval_model_name_or_path is not None:
+      self.tokenizer = transformers.AutoTokenizer.\
+        from_pretrained(gen_ppl_eval_model_name_or_path)
+      if self.tokenizer.pad_token is None:
+        self.tokenizer.pad_token = self.tokenizer.eos_token
+        self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
 
   def to(self, *args, **kwargs):
     self.gen_ppl = self.gen_ppl.to(*args, **kwargs)
@@ -169,6 +171,10 @@ class Metrics:
     device='cuda') -> None:
     
     os.environ['TOKENIZERS_PARALLELISM'] = 'false'
+    if self.gen_ppl_eval_model_name_or_path is None:
+      raise ValueError(
+        'gen_ppl_eval_model_name_or_path must be set to compute '
+        'generative perplexity.')
     eval_model = transformers.AutoModelForCausalLM.from_pretrained(
       self.gen_ppl_eval_model_name_or_path).eval()
     if 'llama2' not in self.gen_ppl_eval_model_name_or_path:

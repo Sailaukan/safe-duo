@@ -24,7 +24,7 @@ class AR(trainer_base.TrainerBase):
       self.mask_index = tokenizer.mask_token_id
     super().__init__(config, tokenizer,
                      vocab_size=vocab_size)
-    self.save_hyperparameters()
+    self.save_hyperparameters(ignore=['tokenizer'])
     self._validate_configuration()
 
   def _validate_configuration(self):
@@ -38,16 +38,21 @@ class AR(trainer_base.TrainerBase):
     valid_tokens = valid_tokens[:, 1:]
     return input_tokens, output_tokens, valid_tokens
 
-  def nll(self, input_tokens, output_tokens,
-          current_accumulation_step):
-    del current_accumulation_step
+  def nll(self, input_tokens, labels, output_tokens,
+          current_accumulation_step=None, train_mode=False):
+    del labels, current_accumulation_step, train_mode
     output = self.backbone(input_tokens, None)
     output[:, :, self.mask_index] = self.neg_infinity
     output = output.log_softmax(-1)
     return - output.gather(
       -1, output_tokens[:, :, None])[:, :, 0]
 
-  def generate_samples(self, num_samples, **kwargs):
+  def generate_samples(self, num_samples, token_template=None,
+                       known_token_mask=None, **kwargs):
+    if token_template is not None or known_token_mask is not None:
+      raise NotImplementedError(
+        'Known-token template sampling is implemented for diffusion '
+        'models, not AR.')
     # precompute token buffer
     num_pred_tokens = self.num_tokens - 1
     x = torch.zeros(
@@ -590,14 +595,17 @@ class DUO(DUO_BASE):
                           device=self.device)
     return alpha_t * x + sigma_t * epsilon
 
-  def nll(self, x0, output_tokens,
+  def nll(self, x0, labels, output_tokens,
           current_accumulation_step=None, train_mode=False):
     use_true_nll = (self.global_step > self.curriculum_end
                     or not train_mode)
     if use_true_nll:
-      return super().nll(x0, output_tokens,
-                         current_accumulation_step)
-    del output_tokens
+      return super().nll(x0, labels, output_tokens,
+                         current_accumulation_step, train_mode)
+    if self.class_conditional:
+      raise NotImplementedError(
+        'DUO curriculum loss does not support class labels.')
+    del labels, output_tokens
     t = self._sample_t(x0.shape[0], current_accumulation_step)
     gamma_t = self.gamma_min + t * (self.gamma_max
                                     - self.gamma_min)
@@ -640,7 +648,7 @@ class Distillation(DUO):
   def __init__(self, config, tokenizer):
     super().__init__(config, tokenizer)
     self.update_teacher_every = config.algo.update_teacher_every
-    self.save_hyperparameters()
+    self.save_hyperparameters(ignore=['tokenizer'])
     self.teacher = None
     self.teacher_ema = config.algo.teacher_ema
     self.linear_growth_dt = config.algo.linear_growth_dt
@@ -713,9 +721,9 @@ class Distillation(DUO):
     n = self.global_step // self.update_teacher_every
     return 2 ** n / self.T
 
-  def nll(self, x0, output_tokens,
+  def nll(self, x0, labels, output_tokens,
           current_accumulation_step=None, train_mode=None):
-    del output_tokens, train_mode
+    del labels, output_tokens, train_mode
     t = self._sample_t(x0.shape[0], current_accumulation_step)
     dt = self._compute_dt()
     t = torch.clip(t + dt, 0, 1)

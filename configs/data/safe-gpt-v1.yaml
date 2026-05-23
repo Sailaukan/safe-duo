@@ -1,0 +1,12 @@
+train: safe-gpt-v1
+valid: safe-gpt-v1
+modality: molecule
+tokenizer_name_or_path: safe-gpt
+tokenizer_revision: b83175cd7394
+cache_dir: /tmp/data
+wrap: False
+streaming: True
+insert_train_eos: False
+insert_valid_eos: False
+train_revision: b83175cd7394
+valid_revision: b83175cd7394
