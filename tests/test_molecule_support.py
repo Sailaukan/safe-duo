@@ -78,7 +78,8 @@ def _tiny_config(tmp_path, algo_name='duo_base'):
       'gen_ppl_eval_model_name_or_path': None,
       'perplexity_batch_size': 1,
     },
-    'data': {'tokenizer_name_or_path': 'safe-gpt'},
+    'data': {'tokenizer_name_or_path': 'safe-gpt',
+             'modality': 'molecule'},
     'optim': {
       'lr': 1e-4,
       'beta1': 0.9,
@@ -92,6 +93,7 @@ def _tiny_config(tmp_path, algo_name='duo_base'):
 def test_safe_tokenizer_special_ids_and_roundtrip():
   pytest.importorskip('safe')
   import dataloader
+  import molecule_utils
 
   tokenizer = dataloader.get_tokenizer(_tokenizer_config())
   assert tokenizer.vocab_size == 1880
@@ -111,6 +113,16 @@ def test_safe_tokenizer_special_ids_and_roundtrip():
     skip_special_tokens=True,
     clean_up_tokenization_spaces=False)
   assert decoded == 'CCO'
+
+  eos_position = encoded['input_ids'].index(tokenizer.eos_token_id)
+  generated_ids = (
+    encoded['input_ids'][:eos_position + 1]
+    + [27, 27, 27]
+    + encoded['input_ids'][eos_position + 4:])
+  assert molecule_utils.decode_token_ids_to_safe(
+    generated_ids, tokenizer) == 'CCO'
+  assert molecule_utils.token_decode_metadata(
+    generated_ids, tokenizer)['decoded_length'] == eos_position
 
 
 def test_safe_gpt_v1_streaming_batch_shape():
@@ -180,7 +192,7 @@ def test_duo_loss_runs_on_safe_batch(tmp_path):
     batch['attention_mask'],
     train_mode=True)
   assert torch.isfinite(loss.loss)
-  assert loss.num_tokens.item() > 0
+  assert loss.num_tokens.item() == batch['input_ids'].numel()
 
 
 def test_conditional_sampler_preserves_known_tokens(tmp_path):
@@ -208,3 +220,35 @@ def test_conditional_sampler_preserves_known_tokens(tmp_path):
     token_template=template,
     known_token_mask=known_mask)
   assert torch.equal(samples[:, :4], template[:4].expand(2, -1))
+  assert torch.equal(
+    samples[:, 4:],
+    torch.full_like(samples[:, 4:], tokenizer.pad_token_id))
+
+
+def test_molecule_sampler_forces_boundaries_and_forbidden_tokens(tmp_path):
+  pytest.importorskip('safe')
+  import algo
+  import dataloader
+  import molecule_utils
+
+  tokenizer = dataloader.get_tokenizer(_tokenizer_config())
+  model = algo.DUO_BASE(
+    _tiny_config(tmp_path, algo_name='duo_base'),
+    tokenizer)
+
+  samples = model.generate_samples(8, num_steps=1, eps=1e-3)
+  forbidden = {
+    tokenizer.bos_token_id,
+    tokenizer.unk_token_id,
+    tokenizer.mask_token_id,
+  }
+  assert torch.equal(
+    samples[:, 0],
+    torch.full_like(samples[:, 0], tokenizer.bos_token_id))
+  for token_id in forbidden:
+    assert not torch.any(samples[:, 1:] == token_id)
+
+  diagnostics = molecule_utils.token_decode_summary(
+    samples, tokenizer)
+  assert diagnostics['first_token_is_bos_rate'] == 1.0
+  assert 'decoded_length_median' in diagnostics

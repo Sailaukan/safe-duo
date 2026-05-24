@@ -350,8 +350,13 @@ class TrainerBase(L.LightningModule):
           num_samples=self.config.loader.eval_batch_size)
         
         self.metrics.record_entropy(samples)
-        # Decode the samples to be re-tokenized by eval model
-        text_samples = self.tokenizer.batch_decode(samples)
+        # Decode the samples to be re-tokenized by eval model.
+        if self.config.data.get('modality', None) == 'molecule':
+          import molecule_utils
+          text_samples = molecule_utils.decode_token_batch_to_safe(
+            samples, self.tokenizer)
+        else:
+          text_samples = self.tokenizer.batch_decode(samples)
         if self.config.eval.compute_generative_perplexity:
           self.metrics.record_generative_perplexity(
             text_samples, self.num_tokens, self.device)
@@ -419,6 +424,8 @@ class TrainerBase(L.LightningModule):
   def _loss(self, x0, labels, valid_tokens,
             current_accumulation_step=None,
             train_mode=False):
+    if self._is_molecule_modality():
+      valid_tokens = torch.ones_like(valid_tokens)
     (input_tokens, output_tokens,
      valid_tokens) = self._process_model_input(
        x0, valid_tokens)
@@ -437,6 +444,12 @@ class TrainerBase(L.LightningModule):
                 nlls=nlls,
                 prior_loss=0.0,
                 num_tokens=num_tokens)
+
+  def _is_molecule_modality(self):
+    data_config = getattr(self.config, 'data', {})
+    if hasattr(data_config, 'get'):
+      return data_config.get('modality', None) == 'molecule'
+    return getattr(data_config, 'modality', None) == 'molecule'
 
 
 class Diffusion(TrainerBase):
@@ -630,6 +643,84 @@ class Diffusion(TrainerBase):
     return ((p_x0_cond, p_x0_uncond), 
             un_normalized_posterior.softmax(-1))
 
+  def _molecule_forbidden_token_ids(self):
+    if not self._is_molecule_modality():
+      return []
+    ids = []
+    for name in ('bos_token_id', 'cls_token_id',
+                 'unk_token_id', 'mask_token_id'):
+      token_id = getattr(self.tokenizer, name, None)
+      if token_id is not None and token_id not in ids:
+        ids.append(token_id)
+    return ids
+
+  def _constrain_molecule_probs(self, probs):
+    if not self._is_molecule_modality():
+      return probs
+    bos_id = getattr(self.tokenizer, 'bos_token_id', None)
+    if bos_id is None:
+      return probs
+    probs = probs.clone()
+    forbidden_ids = self._molecule_forbidden_token_ids()
+    if probs.shape[1] > 1 and forbidden_ids:
+      probs[:, 1:, forbidden_ids] = 0
+    probs[:, 0, :] = 0
+    probs[:, 0, bos_id] = 1
+
+    totals = probs.sum(dim=-1, keepdim=True)
+    if torch.all(totals > 0):
+      return probs / totals
+
+    fallback = torch.ones_like(probs)
+    if fallback.shape[1] > 1 and forbidden_ids:
+      fallback[:, 1:, forbidden_ids] = 0
+    fallback[:, 0, :] = 0
+    fallback[:, 0, bos_id] = 1
+    fallback = fallback / fallback.sum(dim=-1, keepdim=True)
+    return torch.where(totals > 0, probs / totals.clamp_min(1e-30),
+                       fallback)
+
+  def _constrain_molecule_logits(self, logits):
+    if not self._is_molecule_modality():
+      return logits
+    bos_id = getattr(self.tokenizer, 'bos_token_id', None)
+    if bos_id is None:
+      return logits
+    logits = logits.clone()
+    forbidden_ids = self._molecule_forbidden_token_ids()
+    if logits.shape[1] > 1 and forbidden_ids:
+      logits[:, 1:, forbidden_ids] = self.neg_infinity
+    logits[:, 0, :] = self.neg_infinity
+    logits[:, 0, bos_id] = 0
+    return logits
+
+  def _normalize_molecule_tokens(self, x, trim_after_stop=False):
+    if not self._is_molecule_modality():
+      return x
+    bos_id = getattr(self.tokenizer, 'bos_token_id', None)
+    pad_id = getattr(self.tokenizer, 'pad_token_id', None)
+    if bos_id is None:
+      return x
+    x = x.clone()
+    x[:, 0] = bos_id
+
+    forbidden_ids = self._molecule_forbidden_token_ids()
+    if x.shape[1] > 1 and forbidden_ids and pad_id is not None:
+      forbidden = torch.zeros_like(x[:, 1:], dtype=torch.bool)
+      for token_id in forbidden_ids:
+        forbidden |= x[:, 1:] == token_id
+      x[:, 1:] = torch.where(forbidden, torch.full_like(x[:, 1:], pad_id),
+                             x[:, 1:])
+
+    if not trim_after_stop or pad_id is None:
+      return x
+    eos_id = getattr(self.tokenizer, 'eos_token_id', None)
+    stop = x == pad_id
+    if eos_id is not None:
+      stop |= x == eos_id
+    after_first_stop = stop.cumsum(-1) - stop.to(torch.long) > 0
+    return torch.where(after_first_stop, torch.full_like(x, pad_id), x)
+
   def _ancestral_update(self, x, t, labels, dt, p_x0=None, 
                         noise_removal_step=False):
     _, alpha_t = self.noise(t)
@@ -644,6 +735,7 @@ class Diffusion(TrainerBase):
 
     p_x0, q_xs = self._get_ancestral_posterior(x, sigma, 
       labels, alpha_s, alpha_t, p_x0)
+    q_xs = self._constrain_molecule_probs(q_xs)
 
     return p_x0, sample_categorical(q_xs)
 
@@ -669,6 +761,7 @@ class Diffusion(TrainerBase):
     pc_q_xs = self._forward_process(q_x0, alpha_s)
 
     q_sample = kappa * q_xs + (1 - kappa) * pc_q_xs
+    q_sample = self._constrain_molecule_probs(q_sample)
     return p_x0, sample_categorical(q_sample)
 
   def _get_sampling_time_profile(self, eps, num_steps):
@@ -750,9 +843,11 @@ class Diffusion(TrainerBase):
     if num_steps is None:
       num_steps = self.config.sampling.steps
     x = self.prior_sample(num_samples, self.num_tokens)
+    x = self._normalize_molecule_tokens(x)
     if token_template is not None or known_token_mask is not None:
       x = self._apply_known_token_template(
         x, token_template, known_token_mask)
+      x = self._normalize_molecule_tokens(x)
     use_psi_sampler = self.config.sampling.predictor == 'psi'
     timesteps = self._get_sampling_time_profile(eps, 
                                                 num_steps)
@@ -791,6 +886,7 @@ class Diffusion(TrainerBase):
       if token_template is not None or known_token_mask is not None:
         x = self._apply_known_token_template(
           x, token_template, known_token_mask)
+      x = self._normalize_molecule_tokens(x)
 
     t0 = timesteps[-1] * torch.ones(x.shape[0], 1,
                                     device=self.device)
@@ -802,10 +898,13 @@ class Diffusion(TrainerBase):
           dt=None, p_x0=p_x0_cache, noise_removal_step=True)
     elif self.config.sampling.noise_removal == 'greedy':
       sigma = self._sigma_from_alphat(self.noise(t0)[1])
-      x = self.forward(xt=x, sigma=sigma).argmax(dim=-1)
+      logits = self._constrain_molecule_logits(
+        self.forward(xt=x, sigma=sigma))
+      x = logits.argmax(dim=-1)
     if token_template is not None or known_token_mask is not None:
       x = self._apply_known_token_template(
         x, token_template, known_token_mask)
+    x = self._normalize_molecule_tokens(x, trim_after_stop=True)
     return x
 
   def _apply_known_token_template(self, x, token_template,
@@ -973,6 +1072,7 @@ class AbsorbingState(Diffusion):
       score = score.to(torch.float64)
     stag_score = self._staggered_score(score, dsigma)
     probs = stag_score * self._transp_transition(x, dsigma)
+    probs = self._constrain_molecule_probs(probs)
     return sample_categorical(probs)
 
   def _denoiser_update(self, x, t):
@@ -983,6 +1083,7 @@ class AbsorbingState(Diffusion):
     stag_score = self._staggered_score(score, sigma)
     probs = stag_score * self._transp_transition(x, sigma)
     probs[..., self.mask_index] = 0
+    probs = self._constrain_molecule_probs(probs)
     samples = sample_categorical(probs)
     return samples
 

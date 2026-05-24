@@ -1,6 +1,7 @@
 import argparse
 import csv
 import json
+import sys
 from pathlib import Path
 
 import pandas as pd
@@ -210,6 +211,21 @@ def _load_model_from_checkpoint(checkpoint_path, device):
   return model, tokenizer
 
 
+def _denovo_template(tokenizer, length):
+  template = torch.full((length,), tokenizer.pad_token_id, dtype=torch.long)
+  known_mask = torch.zeros((length,), dtype=torch.bool)
+  template[0] = tokenizer.bos_token_id
+  known_mask[0] = True
+  return template, known_mask
+
+
+def _record_generated_tokens(rows, token_ids, tokenizer):
+  for row, ids in zip(rows, token_ids):
+    raw_ids = ids.detach().cpu().tolist()
+    row['raw_token_ids'] = json.dumps(raw_ids)
+    row.update(molecule_utils.token_decode_metadata(raw_ids, tokenizer))
+
+
 @torch.no_grad()
 def _sample_denovo(args):
   device = args.device
@@ -220,25 +236,39 @@ def _sample_denovo(args):
     device=device)
 
   safe_strings = []
+  raw_batches = []
+  token_template, known_token_mask = _denovo_template(
+    tokenizer, model.num_tokens)
   remaining = args.num_samples
   while remaining > 0:
     batch_size = min(args.batch_size, remaining)
     samples = model.generate_samples(
       num_samples=batch_size,
       num_steps=args.steps,
-      eps=args.eps)
+      eps=args.eps,
+      token_template=token_template,
+      known_token_mask=known_token_mask)
+    raw_batches.append(samples.detach().cpu())
     safe_strings.extend(
       molecule_utils.decode_token_batch_to_safe(samples, tokenizer))
     remaining -= batch_size
 
+  all_tokens = torch.cat(raw_batches, dim=0)
   records = molecule_utils.evaluate_molecules(
     safe_strings=safe_strings,
     qed_threshold=args.qed_threshold,
     sa_threshold=args.sa_threshold)
+  token_diagnostics = molecule_utils.token_decode_summary(
+    all_tokens, tokenizer, records)
+  if token_diagnostics['first_token_is_bos_rate'] != 1.0:
+    print(
+      'warning: de novo sampling produced non-BOS first tokens',
+      file=sys.stderr)
   summary = {
     'task': 'denovo',
     'checkpoint': args.checkpoint,
     'metrics': molecule_utils.generation_metrics(records),
+    'token_diagnostics': token_diagnostics,
   }
   molecule_utils.write_json(summary, args.output)
   if args.records_output:
@@ -247,6 +277,7 @@ def _sample_denovo(args):
       row = record.to_dict()
       row['safe'] = safe_string
       rows.append(row)
+    _record_generated_tokens(rows, all_tokens, tokenizer)
     _write_records_csv(rows, args.records_output)
 
 
@@ -261,6 +292,8 @@ def _sample_template(args):
   prompt_rows = _read_rows(args.input)
 
   all_rows = []
+  all_record_objs = []
+  all_token_batches = []
   for prompt_index, prompt_row in enumerate(prompt_rows):
     template_ids, known_mask = _template_from_row(
       prompt_row,
@@ -268,6 +301,7 @@ def _sample_template(args):
       model.num_tokens,
       args)
     safe_strings = []
+    raw_batches = []
     remaining = args.num_samples_per_template
     while remaining > 0:
       batch_size = min(args.batch_size, remaining)
@@ -277,14 +311,18 @@ def _sample_template(args):
         eps=args.eps,
         token_template=torch.tensor(template_ids),
         known_token_mask=torch.tensor(known_mask))
+      raw_batches.append(samples.detach().cpu())
       safe_strings.extend(
         molecule_utils.decode_token_batch_to_safe(samples, tokenizer))
       remaining -= batch_size
 
+    prompt_tokens = torch.cat(raw_batches, dim=0)
+    all_token_batches.append(prompt_tokens)
     records = molecule_utils.evaluate_molecules(
       safe_strings=safe_strings,
       qed_threshold=args.qed_threshold,
       sa_threshold=args.sa_threshold)
+    all_record_objs.extend(records)
     for safe_string, record in zip(safe_strings, records):
       row = record.to_dict()
       row['safe'] = safe_string
@@ -293,6 +331,8 @@ def _sample_template(args):
       if args.reference_col in prompt_row:
         row['reference_smiles'] = prompt_row[args.reference_col]
       all_rows.append(row)
+    _record_generated_tokens(all_rows[-len(records):], prompt_tokens,
+                             tokenizer)
 
   metrics_rows = [
     {
@@ -306,6 +346,8 @@ def _sample_template(args):
     'task': 'fragment',
     'checkpoint': args.checkpoint,
     'metrics_by_task': molecule_utils.fragment_metrics(metrics_rows),
+    'token_diagnostics': molecule_utils.token_decode_summary(
+      torch.cat(all_token_batches, dim=0), tokenizer, all_record_objs),
   }
   molecule_utils.write_json(summary, args.output)
   if args.records_output:

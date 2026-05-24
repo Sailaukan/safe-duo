@@ -54,9 +54,65 @@ def _to_id_list(token_ids):
   return [int(token_id) for token_id in token_ids]
 
 
+def _tokenizer_id(tokenizer, name: str) -> Optional[int]:
+  token_id = getattr(tokenizer, name, None)
+  if token_id is None:
+    return None
+  return int(token_id)
+
+
+def trim_token_ids_for_molecule_decode(token_ids, tokenizer) -> list[int]:
+  """Keep only the generated molecule span before EOS/padding.
+
+  SAFE-GPT V1 training examples are `[CLS] safe [SEP] [PAD]...`, and pad
+  positions are usually loss-masked. Decoding the full fixed-length sample can
+  append arbitrary post-EOS tokens to an otherwise valid molecule.
+  """
+  ids = _to_id_list(token_ids)
+  stop_ids = {
+    token_id for token_id in (
+      _tokenizer_id(tokenizer, 'eos_token_id'),
+      _tokenizer_id(tokenizer, 'sep_token_id'),
+      _tokenizer_id(tokenizer, 'pad_token_id'),
+    )
+    if token_id is not None
+  }
+  for idx, token_id in enumerate(ids):
+    if token_id in stop_ids:
+      return ids[:idx]
+  return ids
+
+
+def token_decode_metadata(token_ids, tokenizer) -> dict:
+  ids = _to_id_list(token_ids)
+
+  def first_position(*names):
+    wanted = {
+      token_id for token_id in (
+        _tokenizer_id(tokenizer, name) for name in names)
+      if token_id is not None
+    }
+    for idx, token_id in enumerate(ids):
+      if token_id in wanted:
+        return idx
+    return None
+
+  return {
+    'raw_length': len(ids),
+    'first_token_id': ids[0] if ids else None,
+    'first_token_is_bos': (
+      ids[0] == _tokenizer_id(tokenizer, 'bos_token_id')
+      if ids and _tokenizer_id(tokenizer, 'bos_token_id') is not None
+      else False),
+    'decoded_length': len(trim_token_ids_for_molecule_decode(ids, tokenizer)),
+    'eos_position': first_position('eos_token_id', 'sep_token_id'),
+    'pad_position': first_position('pad_token_id'),
+  }
+
+
 def decode_token_ids_to_safe(token_ids, tokenizer) -> str:
   return tokenizer.decode(
-    _to_id_list(token_ids),
+    trim_token_ids_for_molecule_decode(token_ids, tokenizer),
     skip_special_tokens=True,
     clean_up_tokenization_spaces=False)
 
@@ -208,8 +264,8 @@ def evaluate_molecules(safe_strings: Optional[Iterable[str]] = None,
       canonical is not None
       and qed is not None
       and sa is not None
-      and qed > qed_threshold
-      and sa < sa_threshold)
+      and qed >= qed_threshold
+      and sa <= sa_threshold)
     records.append(MoleculeEvaluation(
       source=source,
       smiles=raw_smiles,
@@ -362,6 +418,63 @@ def lead_optimization_metrics(rows: Iterable[dict],
   }
 
 
+def token_decode_summary(token_ids_batch, tokenizer,
+                         records: Optional[Iterable[
+                           MoleculeEvaluation]] = None) -> dict:
+  if isinstance(token_ids_batch, torch.Tensor):
+    token_ids_batch = token_ids_batch.detach().cpu().tolist()
+  token_ids_batch = list(token_ids_batch)
+  metadata = [
+    token_decode_metadata(token_ids, tokenizer)
+    for token_ids in token_ids_batch
+  ]
+  decoded_lengths = [item['decoded_length'] for item in metadata]
+  eos_found = [item['eos_position'] is not None for item in metadata]
+  pad_found = [item['pad_position'] is not None for item in metadata]
+  first_is_bos = [item['first_token_is_bos'] for item in metadata]
+
+  summary = {
+    'num_samples': len(metadata),
+    'first_token_is_bos_rate': _safe_div(sum(first_is_bos), len(metadata)),
+    'eos_found_rate': _safe_div(sum(eos_found), len(metadata)),
+    'pad_found_rate': _safe_div(sum(pad_found), len(metadata)),
+    'decoded_length_mean': _mean(decoded_lengths),
+    'decoded_length_median': _percentile(decoded_lengths, 50),
+    'decoded_length_p90': _percentile(decoded_lengths, 90),
+  }
+  if records is not None:
+    records = list(records)
+    summary['validity_by_decoded_length_bucket'] = (
+      _validity_by_decoded_length_bucket(decoded_lengths, records))
+  return summary
+
+
+def _validity_by_decoded_length_bucket(decoded_lengths, records):
+  buckets = {
+    '0': lambda value: value == 0,
+    '1-32': lambda value: 1 <= value <= 32,
+    '33-64': lambda value: 33 <= value <= 64,
+    '65-128': lambda value: 65 <= value <= 128,
+    '129-192': lambda value: 129 <= value <= 192,
+    '193-256': lambda value: 193 <= value <= 256,
+    '>256': lambda value: value > 256,
+  }
+  out = {}
+  for name, predicate in buckets.items():
+    bucket_records = [
+      record for length, record in zip(decoded_lengths, records)
+      if predicate(length)
+    ]
+    out[name] = {
+      'num_samples': len(bucket_records),
+      'num_valid': sum(record.valid for record in bucket_records),
+      'validity': _safe_div(
+        sum(record.valid for record in bucket_records),
+        len(bucket_records)),
+    }
+  return out
+
+
 def write_json(data, path: str) -> None:
   parent = os.path.dirname(path)
   if parent:
@@ -377,6 +490,11 @@ def _safe_div(num, denom):
 def _mean(values):
   values = [value for value in values if value is not None]
   return float(np.mean(values)) if values else math.nan
+
+
+def _percentile(values, percentile):
+  values = [value for value in values if value is not None]
+  return float(np.percentile(values, percentile)) if values else math.nan
 
 
 def _json_sanitize(value):

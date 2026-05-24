@@ -121,13 +121,20 @@ def _generate_samples(diffusion_model, config, logger,
       samples = model.restore_model_and_sample(
         num_steps=config.sampling.steps)
       model.metrics.record_entropy(samples)
-      text_samples = model.tokenizer.batch_decode(samples)
-      model.metrics.record_generative_perplexity(
-        text_samples, config.model.length, model.device)
+      if config.data.get('modality', None) == 'molecule':
+        import molecule_utils
+        text_samples = molecule_utils.decode_token_batch_to_safe(
+          samples, model.tokenizer)
+      else:
+        text_samples = model.tokenizer.batch_decode(samples)
+      if config.eval.compute_generative_perplexity:
+        model.metrics.record_generative_perplexity(
+          text_samples, config.model.length, model.device)
       all_samples.extend(list(text_samples))
   generative_ppl = 0.
   entropy = 0.
-  if not config.sampling.semi_ar:
+  if (not config.sampling.semi_ar
+      and config.eval.compute_generative_perplexity):
     generative_ppl = model.metrics.gen_ppl.compute().item()
     entropy = model.metrics.sample_entropy.compute().item()
     logger.info(f'Generative perplexity: {generative_ppl}')
